@@ -1,0 +1,5 @@
+# 不上傳到 GitHub 的檔案
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

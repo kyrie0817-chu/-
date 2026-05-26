@@ -1,0 +1,1213 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>作業點收整合系統</title>
+  <!-- iOS Home Screen PWA -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="作業點收">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#2563eb">
+  <link rel="manifest" href="manifest.json">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', 'Noto Sans TC', sans-serif; }
+    .step-dot { transition: all .3s; }
+    .card-hover { transition: transform .2s, box-shadow .2s; }
+    .card-hover:hover { transform: translateY(-3px); box-shadow: 0 10px 30px rgba(0,0,0,.12); }
+    .fade-enter { animation: fadeIn .25s ease; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    .badge-red    { background:#fee2e2; color:#dc2626; }
+    .badge-orange { background:#ffedd5; color:#ea580c; }
+    .badge-gray   { background:#f3f4f6; color:#6b7280; }
+    .sidebar-item { cursor:pointer; border-radius:.5rem; padding:.6rem 1rem; display:flex; align-items:center; gap:.6rem; transition:background .15s; }
+    .sidebar-item:hover { background:#f1f5f9; }
+    .sidebar-item.active { background:#eff6ff; color:#2563eb; font-weight:600; }
+    .nav-tab { flex:1; display:flex; flex-direction:column; align-items:center; padding:.5rem 0; font-size:.7rem; gap:2px; cursor:pointer; color:#94a3b8; transition:color .15s; }
+    .nav-tab.active { color:#2563eb; }
+    .grid-cell-miss { background:#fee2e2 !important; }
+    .grid-cell-ok   { background:#dcfce7 !important; }
+    textarea:focus, input:focus, select:focus { outline:2px solid #3b82f6; outline-offset:1px; }
+    ::-webkit-scrollbar { width:6px; } ::-webkit-scrollbar-track { background:#f1f5f9; } ::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:3px; }
+    /* iOS safe area (瀏海 / Dynamic Island) */
+    body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+    nav.fixed { padding-bottom: calc(.5rem + env(safe-area-inset-bottom)); }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+<div id="app"></div>
+
+<script>
+(function() {
+  const { createApp } = Vue;
+  const app = createApp({
+    setup() {
+      const { ref, computed, watch, onMounted } = Vue;
+
+      // ── Constants ──────────────────────────────────────────────────────────
+      const STORAGE_KEY = 'hw_collect_v3';
+      const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+      const todayStr = () => new Date().toISOString().slice(0,10);
+      const fmtDate  = d => { const [y,m,dd] = d.split('-'); return `${y}/${m}/${dd}`; };
+
+      // ── State ──────────────────────────────────────────────────────────────
+      const currentView    = ref('home');    // 'home' | 'collection' | 'dashboard'
+      const collectionStep = ref(1);
+      const dashboardTab   = ref('today');
+      const sidebarOpen    = ref(true);
+
+      const dashboardTabs = [
+        { id:'today',    icon:'📋', label:'今日報告' },
+        { id:'history',  icon:'📜', label:'歷史紀錄' },
+        { id:'range',    icon:'📈', label:'區間統計' },
+        { id:'settings', icon:'⚙️', label:'設定'     },
+      ];
+
+      // ── Settings ───────────────────────────────────────────────────────────
+      const className       = ref('');
+      const seatCount       = ref(30);
+      const homeworkItems   = ref(['數學', '國語', '英語', '自然']);
+      const newHwItem       = ref('');
+      const sheetsWebAppUrl = ref('');
+      const emptySeats      = ref([]);   // 空號：不存在的座號
+      const emptySeatsInput = ref('');   // settings 編輯暫存
+
+      // ── Collection State ───────────────────────────────────────────────────
+      const selectedHw  = ref([]);
+      const absentees   = ref([]);       // 今日請假座號（勾選）
+      const missingMap       = ref({});   // { hwName: Set<seat> }
+      const collectionNotes  = ref('');
+
+      // ── History ────────────────────────────────────────────────────────────
+      const historyLog = ref({});    // { 'YYYY-MM-DD': { className, missing:{hw:[seats]}, notes } }
+
+      // ── Range query ───────────────────────────────────────────────────────
+      const rangeStart = ref('');
+      const rangeEnd   = ref('');
+
+      // ── Sync status ───────────────────────────────────────────────────────
+      const syncStatus    = ref('');          // 自動同步（點收當下）
+      const syncStatusMap = ref({});          // 手動同步：{ 'YYYY-MM-DD': 'syncing'|'ok'|'error' }
+
+      // ── Toast ──────────────────────────────────────────────────────────────
+      const toast     = ref('');
+      const toastType = ref('success');
+      let toastTimer  = null;
+      const showToast = (msg, type='success') => {
+        toast.value = msg; toastType.value = type;
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.value = '', 3000);
+      };
+
+      // ── Persist ────────────────────────────────────────────────────────────
+      const persist = debounce(() => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          className:       className.value,
+          seatCount:       seatCount.value,
+          homeworkItems:   homeworkItems.value,
+          sheetsWebAppUrl: sheetsWebAppUrl.value,
+          emptySeats:      emptySeats.value,
+          historyLog:      historyLog.value,
+        }));
+      }, 300);
+
+      const load = () => {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (!raw) return;
+          const d = JSON.parse(raw);
+          if (d.className)       className.value       = d.className;
+          if (d.seatCount)       seatCount.value       = d.seatCount;
+          if (d.homeworkItems)   homeworkItems.value   = d.homeworkItems;
+          if (d.sheetsWebAppUrl) sheetsWebAppUrl.value = d.sheetsWebAppUrl;
+          if (d.emptySeats)      { emptySeats.value = d.emptySeats; emptySeatsInput.value = d.emptySeats.join(', '); }
+          if (d.historyLog)      historyLog.value      = d.historyLog;
+        } catch(e) { console.error(e); }
+      };
+
+      watch([className, seatCount, homeworkItems, sheetsWebAppUrl, emptySeats, historyLog],
+            persist, { deep:true });
+
+      onMounted(load);
+
+      // ── Seat helpers ───────────────────────────────────────────────────────
+      const allSeats = computed(() =>
+        Array.from({ length: seatCount.value }, (_, i) => i + 1));
+
+      // 空號：這個座號不存在
+      const isEmptySeat = seat => emptySeats.value.includes(seat);
+
+      // 儲存空號設定
+      const saveEmptySeats = () => {
+        const input = emptySeatsInput.value.trim();
+        if (!input) { emptySeats.value = []; showToast('已清除空號設定'); return; }
+        const nums = input.split(/[,，、\s]+/)
+          .map(s => parseInt(s))
+          .filter(n => !isNaN(n) && n > 0 && n <= seatCount.value);
+        emptySeats.value = [...new Set(nums)].sort((a,b)=>a-b);
+        emptySeatsInput.value = emptySeats.value.join(', ');
+        showToast(`已設定 ${emptySeats.value.length} 個空號`);
+      };
+
+      const parseSeats = str =>
+        str.split(/[,，、\s]+/).map(s => parseInt(s)).filter(n => n > 0 && n <= seatCount.value && !isEmptySeat(n));
+
+      // ── Today record ───────────────────────────────────────────────────────
+      const todayRecord = computed(() => historyLog.value[todayStr()] ?? null);
+
+      const isTodayCollected = computed(() => !!todayRecord.value);
+
+      const todayTotalMiss = computed(() =>
+        Object.values(todayRecord.value?.missing ?? {}).reduce((s, a) => s + a.length, 0));
+
+      // ── Weekly miss ────────────────────────────────────────────────────────
+      const weeklyMissCount = computed(() => {
+        const days = Object.entries(historyLog.value)
+          .filter(([d]) => {
+            const dt = new Date(d), now = new Date();
+            return (now - dt) / 86400000 <= 7;
+          });
+        let total = 0;
+        days.forEach(([, rec]) =>
+          Object.values(rec.missing ?? {}).forEach(arr => total += arr.length));
+        return total;
+      });
+
+      // ── Top 3 miss students ────────────────────────────────────────────────
+      const topMissStudents = computed(() => {
+        const counter = {};
+        Object.values(historyLog.value).forEach(rec =>
+          Object.values(rec.missing ?? {}).forEach(arr =>
+            arr.forEach(seat => counter[seat] = (counter[seat] ?? 0) + 1)));
+        return Object.entries(counter)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([seat, count]) => ({ seat: parseInt(seat), count }));
+      });
+
+      // ── Accumulated days per student/hw ───────────────────────────────────
+      const getAccumulatedDays = (seat, hw) =>
+        Object.values(historyLog.value)
+          .filter(rec => rec.missing?.[hw]?.includes(seat)).length;
+
+      const totalAccumulatedDays = seat =>
+        homeworkItems.value.reduce((s, hw) => s + getAccumulatedDays(seat, hw), 0);
+
+      // ── Badge helper ───────────────────────────────────────────────────────
+      const daysBadgeClass = days =>
+        days >= 3 ? 'badge-red' : days === 2 ? 'badge-orange' : 'badge-gray';
+
+      // ── Collection flow ────────────────────────────────────────────────────
+      const startCollectionFlow = () => {
+        selectedHw.value      = [];       // 預設全部未選
+        absentees.value       = [];       // 預設無請假
+        missingMap.value      = {};
+        collectionNotes.value = '';
+        collectionStep.value  = 1;
+        currentView.value     = 'collection';
+      };
+
+      // 切換請假狀態
+      const toggleAbsent = seat => {
+        if (isEmptySeat(seat)) return;
+        const idx = absentees.value.indexOf(seat);
+        if (idx >= 0) absentees.value.splice(idx, 1);
+        else absentees.value.push(seat);
+      };
+
+      const isAbsent = seat => absentees.value.includes(seat);
+
+      const goToDashboard = (tab = 'today') => {
+        dashboardTab.value = tab;
+        currentView.value  = 'dashboard';
+      };
+
+      const goToStep = step => {
+        if (step === 2) {
+          if (!selectedHw.value.length) { showToast('請至少選擇一項作業', 'error'); return; }
+        }
+        if (step === 3) {
+          // 預設：所有有效座位（非空號、非請假）全部為「未繳」
+          const activeMissing = allSeats.value.filter(s => !isEmptySeat(s) && !isAbsent(s));
+          const newMap = {};
+          selectedHw.value.forEach(hw => {
+            newMap[hw] = new Set(activeMissing);
+          });
+          missingMap.value = newMap;
+        }
+        collectionStep.value = step;
+      };
+
+      const toggleMissing = (hw, seat) => {
+        if (!missingMap.value[hw]) missingMap.value[hw] = new Set();
+        const s = missingMap.value[hw];
+        if (s.has(seat)) s.delete(seat); else s.add(seat);
+        missingMap.value = { ...missingMap.value };
+      };
+
+      const isMissing = (hw, seat) => missingMap.value[hw]?.has(seat) ?? false;
+
+      // ── 建立「累計積欠天數」對照表（給 Sheets 用）─────────────────────────
+      // 回傳 { hwName: { seat: days } }
+      const buildAccumDays = record => {
+        const result = {};
+        Object.entries(record.missing ?? {}).forEach(([hw, seats]) => {
+          result[hw] = {};
+          seats.forEach(seat => {
+            result[hw][seat] = getAccumulatedDays(seat, hw);
+          });
+        });
+        return result;
+      };
+
+      // ── Core sync helper ──────────────────────────────────────────────────
+      const syncRecord = async (date, record, statusRef, mapKey) => {
+        if (!sheetsWebAppUrl.value) {
+          showToast('請先在設定頁面填入 Google Sheets URL', 'error'); return false;
+        }
+        if (mapKey !== undefined) syncStatusMap.value = { ...syncStatusMap.value, [mapKey]: 'syncing' };
+        if (statusRef) statusRef.value = 'syncing';
+        try {
+          await fetch(sheetsWebAppUrl.value, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: JSON.stringify({ date, ...record, accumDays: buildAccumDays(record) }),
+          });
+          if (mapKey !== undefined) syncStatusMap.value = { ...syncStatusMap.value, [mapKey]: 'ok' };
+          if (statusRef) statusRef.value = 'ok';
+          showToast(`${date} 已同步至 Google 試算表 ✓`);
+          return true;
+        } catch(e) {
+          if (mapKey !== undefined) syncStatusMap.value = { ...syncStatusMap.value, [mapKey]: 'error' };
+          if (statusRef) statusRef.value = 'error';
+          showToast('Google Sheets 同步失敗，請檢查網路或 URL', 'error');
+          return false;
+        }
+      };
+
+      // ── 手動同步單筆 ──────────────────────────────────────────────────────
+      const manualSync = async date => {
+        const rec = historyLog.value[date];
+        if (!rec) { showToast('找不到該筆紀錄', 'error'); return; }
+        await syncRecord(date, rec, null, date);
+      };
+
+      // ── 同步全部歷史 ──────────────────────────────────────────────────────
+      const syncAll = async () => {
+        if (!sheetsWebAppUrl.value) {
+          showToast('請先在設定頁面填入 Google Sheets URL', 'error'); return;
+        }
+        const entries = Object.entries(historyLog.value);
+        if (!entries.length) { showToast('尚無歷史紀錄', 'error'); return; }
+        showToast(`開始同步 ${entries.length} 筆資料…`);
+        let ok = 0, fail = 0;
+        for (const [date, rec] of entries) {
+          syncStatusMap.value = { ...syncStatusMap.value, [date]: 'syncing' };
+          try {
+            await fetch(sheetsWebAppUrl.value, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain' },
+              body: JSON.stringify({ date, ...rec, accumDays: buildAccumDays(rec) }),
+            });
+            syncStatusMap.value = { ...syncStatusMap.value, [date]: 'ok' };
+            ok++;
+          } catch {
+            syncStatusMap.value = { ...syncStatusMap.value, [date]: 'error' };
+            fail++;
+          }
+        }
+        showToast(`同步完成：${ok} 成功${fail ? '、' + fail + ' 失敗' : ''} ✓`, fail ? 'error' : 'success');
+      };
+
+      // ── Save collection ────────────────────────────────────────────────────
+      const saveCollection = async () => {
+        const missing = {};
+        selectedHw.value.forEach(hw => {
+          missing[hw] = [...(missingMap.value[hw] ?? new Set())].sort((a,b)=>a-b);
+        });
+        const record = {
+          className: className.value,
+          missing,
+          absentees: absentees.value,
+          notes:     collectionNotes.value,
+          savedAt:   new Date().toISOString(),
+        };
+        historyLog.value = { ...historyLog.value, [todayStr()]: record };
+        collectionStep.value = 4;
+
+        if (sheetsWebAppUrl.value) {
+          await syncRecord(todayStr(), record, syncStatus, null);
+        } else {
+          showToast('資料儲存成功');
+        }
+      };
+
+      // ── Parent notice ──────────────────────────────────────────────────────
+      const parentReportText = computed(() => {
+        const rec = todayRecord.value;
+        if (!rec) return '';
+        const lines = [`【${rec.className || '班級'}】${fmtDate(todayStr())} 作業缺交通知\n`];
+        const hw_list = selectedHw.value.length ? selectedHw.value : homeworkItems.value;
+        hw_list.forEach(hw => {
+          const seats = rec.missing?.[hw] ?? [];
+          if (!seats.length) return;
+          lines.push(`📚 ${hw}（缺交 ${seats.length} 人）`);
+          seats.forEach(seat => {
+            const days = getAccumulatedDays(seat, hw);
+            lines.push(`  ・座號 ${seat}（累計積欠 ${days} 天）`);
+          });
+        });
+        if (rec.absentees?.length) lines.push(`\n⚠️ 請假：座號 ${rec.absentees.join(', ')}`);
+        if (rec.notes) lines.push(`\n📝 備註：${rec.notes}`);
+        return lines.join('\n');
+      });
+
+      const copyParentNotice = async () => {
+        const text = parentReportText.value;
+        if (!text) { showToast('尚無今日資料', 'error'); return; }
+        // iOS Safari：navigator.clipboard 需要 HTTPS + 使用者操作（已滿足）
+        // HTTP 環境下降級為 textarea + execCommand
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(text);
+            showToast('家長通知已複製到剪貼簿 📋');
+            return;
+          } catch { /* 降級處理 */ }
+        }
+        // 降級：textarea 選取法（iOS HTTP 或舊版瀏覽器）
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        try {
+          document.execCommand('copy');
+          showToast('家長通知已複製到剪貼簿 📋');
+        } catch {
+          showToast('請手動複製以下文字', 'error');
+        } finally {
+          document.body.removeChild(ta);
+        }
+      };
+
+      // ── Range stats ────────────────────────────────────────────────────────
+      const rangeRecords = computed(() => {
+        if (!rangeStart.value || !rangeEnd.value) return [];
+        return Object.entries(historyLog.value)
+          .filter(([d]) => d >= rangeStart.value && d <= rangeEnd.value)
+          .sort(([a],[b]) => a.localeCompare(b));
+      });
+
+      const rangeMissFreq = computed(() => {
+        const counter = {};
+        rangeRecords.value.forEach(([, rec]) =>
+          Object.entries(rec.missing ?? {}).forEach(([hw, seats]) =>
+            seats.forEach(seat => {
+              const key = `${seat}__${hw}`;
+              counter[key] = (counter[key] ?? 0) + 1;
+            })));
+        return Object.entries(counter)
+          .map(([key, cnt]) => {
+            const [seat, hw] = key.split('__');
+            return { seat: parseInt(seat), hw, count: cnt };
+          })
+          .sort((a, b) => b.count - a.count);
+      });
+
+      // ── CSV export ─────────────────────────────────────────────────────────
+      const exportCSV = () => {
+        const rows = [['日期', '班級', '作業', '缺交座號', '累計積欠天數', '備註']];
+        Object.entries(historyLog.value).sort(([a],[b])=>a.localeCompare(b))
+          .forEach(([date, rec]) => {
+            Object.entries(rec.missing ?? {}).forEach(([hw, seats]) => {
+              seats.forEach(seat => {
+                rows.push([
+                  date,
+                  rec.className ?? '',
+                  hw,
+                  seat,
+                  getAccumulatedDays(seat, hw),
+                  rec.notes ?? '',
+                ]);
+              });
+            });
+          });
+        const csv = '\uFEFF' + rows.map(r => r.map(c => `"${c}"`).join(',')).join('\n');
+        const a = document.createElement('a');
+        a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+        a.download = `作業點收_${todayStr()}.csv`;
+        a.click();
+        showToast('CSV 已下載');
+      };
+
+      // ── Delete record ──────────────────────────────────────────────────────
+      const deleteRecord = date => {
+        if (!confirm(`確定要刪除 ${fmtDate(date)} 的紀錄？`)) return;
+        const h = { ...historyLog.value };
+        delete h[date];
+        historyLog.value = h;
+        showToast('已刪除');
+      };
+
+      // ── Homework settings ──────────────────────────────────────────────────
+      const addHwItem = () => {
+        const v = newHwItem.value.trim();
+        if (!v || homeworkItems.value.includes(v)) return;
+        homeworkItems.value = [...homeworkItems.value, v];
+        newHwItem.value = '';
+      };
+      const removeHwItem = i => {
+        homeworkItems.value = homeworkItems.value.filter((_, idx) => idx !== i);
+      };
+
+      // ── PDF export ─────────────────────────────────────────────────────────
+      const exportPDF = async () => {
+        const el = document.getElementById('report-area');
+        if (!el) return;
+        const canvas = await html2canvas(el, { scale: 2, backgroundColor: '#fff' });
+        const { jsPDF } = window.jspdf;
+        const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+        const w = pdf.internal.pageSize.getWidth();
+        const h = (canvas.height / canvas.width) * w;
+        pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, w, h);
+        pdf.save(`作業點收報表_${todayStr()}.pdf`);
+        showToast('PDF 已下載');
+      };
+
+      // ── Sorted history ─────────────────────────────────────────────────────
+      const sortedHistory = computed(() =>
+        Object.entries(historyLog.value)
+          .sort(([a],[b]) => b.localeCompare(a)));
+
+      // ──────────────────────────────────────────────────────────────────────
+      return {
+        currentView, collectionStep, dashboardTab, sidebarOpen, dashboardTabs,
+        className, seatCount, homeworkItems, newHwItem, sheetsWebAppUrl,
+        emptySeats, emptySeatsInput,
+        selectedHw, absentees, missingMap, collectionNotes,
+        historyLog, rangeStart, rangeEnd, syncStatus, syncStatusMap, toast, toastType,
+        allSeats, todayRecord, isTodayCollected, todayTotalMiss,
+        weeklyMissCount, topMissStudents, parentReportText,
+        rangeRecords, rangeMissFreq, sortedHistory,
+        getAccumulatedDays, totalAccumulatedDays, daysBadgeClass,
+        isEmptySeat, isAbsent,
+        startCollectionFlow, goToDashboard, goToStep, toggleMissing,
+        toggleAbsent, isMissing, saveCollection, copyParentNotice,
+        exportCSV, exportPDF, deleteRecord, addHwItem, removeHwItem,
+        manualSync, syncAll, saveEmptySeats, showToast, fmtDate, todayStr,
+      };
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    template: `
+<div class="min-h-screen bg-slate-50">
+
+  <!-- ── Toast ──────────────────────────────────────────────────────────── -->
+  <transition name="fade">
+    <div v-if="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl shadow-xl text-sm font-medium"
+         :class="toastType==='error' ? 'bg-red-500 text-white' : 'bg-green-500 text-white'">
+      {{ toast }}
+    </div>
+  </transition>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       HOME VIEW
+  ══════════════════════════════════════════════════════════════════════════ -->
+  <div v-if="currentView==='home'" class="fade-enter max-w-2xl mx-auto px-4 py-10">
+
+    <div class="text-center mb-10">
+      <div class="text-4xl mb-2">📚</div>
+      <h1 class="text-2xl font-bold text-slate-800">作業點收整合系統</h1>
+      <p class="text-slate-500 mt-1 text-sm">{{ className || '請至設定設定班級名稱' }}</p>
+    </div>
+
+    <!-- Entry Cards -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+      <div @click="startCollectionFlow"
+           class="card-hover cursor-pointer bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col items-center text-center gap-3">
+        <div class="w-14 h-14 rounded-2xl bg-blue-100 flex items-center justify-center text-3xl">✏️</div>
+        <div>
+          <div class="font-bold text-slate-800 text-lg">開始點收作業</div>
+          <div class="text-slate-500 text-sm mt-1">登錄今日缺交情況</div>
+        </div>
+        <div v-if="isTodayCollected" class="mt-1 px-3 py-1 rounded-full bg-green-100 text-green-700 text-xs font-medium">
+          今日已點收 ✓
+        </div>
+      </div>
+
+      <div @click="goToDashboard('today')"
+           class="card-hover cursor-pointer bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col items-center text-center gap-3">
+        <div class="w-14 h-14 rounded-2xl bg-purple-100 flex items-center justify-center text-3xl">📊</div>
+        <div>
+          <div class="font-bold text-slate-800 text-lg">查看資料儀表板</div>
+          <div class="text-slate-500 text-sm mt-1">報告、歷史、統計</div>
+        </div>
+        <div class="mt-1 px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-xs font-medium">
+          共 {{ Object.keys(historyLog).length }} 筆紀錄
+        </div>
+      </div>
+    </div>
+
+    <!-- Quick Stats -->
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+      <div class="text-sm font-semibold text-slate-500 mb-3">近況摘要</div>
+      <div class="grid grid-cols-2 gap-4">
+        <div class="text-center">
+          <div class="text-2xl font-bold text-blue-600">{{ weeklyMissCount }}</div>
+          <div class="text-xs text-slate-500 mt-1">近 7 天缺交次數</div>
+        </div>
+        <div class="text-center">
+          <div class="text-2xl font-bold text-orange-500">{{ todayTotalMiss }}</div>
+          <div class="text-xs text-slate-500 mt-1">今日缺交人次</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Top missers -->
+    <div v-if="topMissStudents.length" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+      <div class="text-sm font-semibold text-slate-500 mb-3">🏆 累計缺交前三名</div>
+      <div class="space-y-2">
+        <div v-for="(s,i) in topMissStudents" :key="s.seat"
+             class="flex items-center justify-between py-2 px-3 rounded-lg bg-slate-50">
+          <div class="flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-slate-200 text-slate-600 text-xs flex items-center justify-center font-bold">{{ i+1 }}</span>
+            <span class="text-slate-700 font-medium">座號 {{ s.seat }}</span>
+          </div>
+          <span class="text-sm font-semibold" :class="s.count>=5?'text-red-500':s.count>=3?'text-orange-500':'text-slate-500'">
+            {{ s.count }} 次
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- No records prompt -->
+    <div v-if="!Object.keys(historyLog).length" class="mt-6 text-center text-slate-400 text-sm py-8">
+      尚無歷史紀錄，點擊「開始點收作業」登錄第一筆 🎉
+    </div>
+
+    <!-- Settings shortcut -->
+    <div class="mt-6 text-center">
+      <button @click="goToDashboard('settings')" class="text-sm text-slate-400 hover:text-blue-500 transition-colors">
+        ⚙️ 系統設定
+      </button>
+    </div>
+  </div>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       COLLECTION VIEW (Wizard)
+  ══════════════════════════════════════════════════════════════════════════ -->
+  <div v-if="currentView==='collection'" class="fade-enter max-w-2xl mx-auto px-4 py-6">
+
+    <!-- Header -->
+    <div class="flex items-center gap-3 mb-6">
+      <button @click="currentView='home'" class="p-2 rounded-lg hover:bg-slate-200 transition-colors">
+        <svg class="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/>
+        </svg>
+      </button>
+      <h2 class="text-xl font-bold text-slate-800">點收作業</h2>
+      <span class="ml-auto text-sm text-slate-500">{{ todayStr() }}</span>
+    </div>
+
+    <!-- Step Indicator -->
+    <div class="flex items-center mb-8 px-2">
+      <template v-for="(s,i) in [{l:'選擇作業'},{l:'登記請假'},{l:'點收登錄'},{l:'完成報告'}]" :key="i">
+        <div class="flex flex-col items-center" style="min-width:48px">
+          <div class="step-dot w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold border-2"
+               :class="collectionStep>i+1 ? 'bg-blue-500 border-blue-500 text-white'
+                      : collectionStep===i+1 ? 'bg-blue-500 border-blue-500 text-white'
+                      : 'bg-white border-slate-300 text-slate-400'">
+            <span v-if="collectionStep>i+1">✓</span>
+            <span v-else>{{ i+1 }}</span>
+          </div>
+          <span class="text-xs mt-1 text-slate-500 text-center leading-tight" style="max-width:52px">{{ s.l }}</span>
+        </div>
+        <div v-if="i<3" class="flex-1 h-0.5 mx-1 mb-4"
+             :class="collectionStep>i+1 ? 'bg-blue-500' : 'bg-slate-200'"></div>
+      </template>
+    </div>
+
+    <!-- ── Step 1: Select Homework ── -->
+    <div v-if="collectionStep===1" class="fade-enter bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+      <h3 class="font-semibold text-slate-700 mb-4">今日要點收哪些作業？</h3>
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
+        <button v-for="hw in homeworkItems" :key="hw"
+                @click="selectedHw.includes(hw) ? selectedHw.splice(selectedHw.indexOf(hw),1) : selectedHw.push(hw)"
+                class="py-3 px-4 rounded-xl border-2 text-sm font-medium transition-all"
+                :class="selectedHw.includes(hw) ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600 hover:border-slate-300'">
+          {{ hw }}
+        </button>
+      </div>
+      <div v-if="!homeworkItems.length" class="text-sm text-slate-400 mb-4 text-center py-4">
+        請先至設定頁面新增作業項目
+      </div>
+      <button @click="goToStep(2)" :disabled="!selectedHw.length"
+              class="w-full py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 disabled:opacity-40 transition-colors">
+        下一步 →
+      </button>
+    </div>
+
+    <!-- ── Step 2: Absentees (checkbox grid) ── -->
+    <div v-if="collectionStep===2" class="fade-enter bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+      <div class="flex items-center justify-between mb-1">
+        <h3 class="font-semibold text-slate-700">今日請假座號</h3>
+        <span class="text-xs text-amber-600 font-medium bg-amber-50 px-2 py-0.5 rounded-full">
+          已選 {{ absentees.length }} 人
+        </span>
+      </div>
+      <p class="text-sm text-slate-400 mb-4">點擊座號來標示請假（可不填）</p>
+      <div class="grid gap-2 mb-5" style="grid-template-columns: repeat(auto-fill, minmax(44px, 1fr))">
+        <button v-for="seat in allSeats" :key="seat"
+                @click="toggleAbsent(seat)"
+                :disabled="isEmptySeat(seat)"
+                class="h-10 rounded-lg text-sm font-medium border transition-all"
+                :class="isEmptySeat(seat) ? 'bg-slate-50 text-slate-200 cursor-not-allowed border-slate-100'
+                       : isAbsent(seat)   ? 'bg-amber-100 border-amber-400 text-amber-700 ring-2 ring-amber-300'
+                       :                    'bg-white border-slate-200 text-slate-600 hover:border-amber-300 hover:bg-amber-50'"
+                :title="isEmptySeat(seat)?'空號':isAbsent(seat)?'請假（點擊取消）':'點擊標示請假'">
+          {{ seat }}
+        </button>
+      </div>
+      <div class="flex gap-4 text-xs text-slate-400 mb-5">
+        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border border-slate-200 bg-white inline-block"></span>正常</span>
+        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border-2 border-amber-400 bg-amber-100 inline-block"></span>請假</span>
+        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border border-slate-100 bg-slate-50 inline-block"></span>空號</span>
+      </div>
+      <div class="flex gap-3">
+        <button @click="collectionStep=1" class="flex-1 py-3 rounded-xl font-semibold text-slate-600 border border-slate-300 hover:bg-slate-50 transition-colors">
+          ← 上一步
+        </button>
+        <button @click="goToStep(3)" class="flex-1 py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 transition-colors">
+          下一步 →
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Step 3: Collection Grid ── -->
+    <div v-if="collectionStep===3" class="fade-enter">
+      <div v-for="hw in selectedHw" :key="hw" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold text-slate-700">📖 {{ hw }}</h3>
+          <span class="text-xs text-slate-400">
+            缺交 {{ [...(missingMap[hw]??new Set())].length }} 人
+          </span>
+        </div>
+        <div class="grid gap-2" style="grid-template-columns: repeat(auto-fill, minmax(44px, 1fr))">
+          <button v-for="seat in allSeats" :key="seat"
+                  @click="!isAbsent(seat) && !isEmptySeat(seat) && toggleMissing(hw, seat)"
+                  :disabled="isAbsent(seat) || isEmptySeat(seat)"
+                  class="h-10 rounded-lg text-sm font-medium border transition-all"
+                  :class="isEmptySeat(seat) ? 'bg-slate-50 text-slate-200 cursor-not-allowed border-slate-100'
+                         : isAbsent(seat)   ? 'bg-amber-50 text-amber-300 cursor-not-allowed border-amber-100'
+                         : isMissing(hw,seat) ? 'bg-red-100 border-red-300 text-red-700 hover:bg-red-200'
+                         : 'bg-green-50 border-green-200 text-green-700 hover:bg-green-100'"
+                  :title="isEmptySeat(seat)?'空號':isAbsent(seat)?'請假':isMissing(hw,seat)?'未繳（點擊標示已繳）':'已繳（點擊改為未繳）'">
+            {{ seat }}
+          </button>
+        </div>
+        <div class="flex gap-4 mt-2 text-xs text-slate-400">
+          <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-red-100 border border-red-300 inline-block"></span>未繳</span>
+          <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-green-100 border border-green-200 inline-block"></span>已繳</span>
+          <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-amber-50 border border-amber-100 inline-block"></span>請假</span>
+          <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-slate-50 border border-slate-100 inline-block"></span>空號</span>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+        <label class="text-sm font-medium text-slate-600 block mb-2">備註（選填）</label>
+        <textarea v-model="collectionNotes" rows="2" placeholder="今日備註..."
+                  class="w-full border border-slate-300 rounded-xl px-4 py-3 text-sm resize-none"></textarea>
+      </div>
+
+      <div class="flex gap-3">
+        <button @click="collectionStep=2" class="flex-1 py-3 rounded-xl font-semibold text-slate-600 border border-slate-300 hover:bg-slate-50 bg-white transition-colors">
+          ← 上一步
+        </button>
+        <button @click="saveCollection" class="flex-1 py-3 rounded-xl font-semibold text-white bg-green-500 hover:bg-green-600 transition-colors">
+          ✓ 儲存點收
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Step 4: Report ── -->
+    <div v-if="collectionStep===4" class="fade-enter">
+      <div id="report-area" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-4">
+        <div class="flex items-center gap-3 mb-5">
+          <div class="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center text-xl">✓</div>
+          <div>
+            <div class="font-bold text-slate-800">點收完成</div>
+            <div class="text-sm text-slate-500">{{ className }} · {{ todayStr() }}</div>
+          </div>
+          <div v-if="syncStatus" class="ml-auto text-xs px-2 py-1 rounded-full"
+               :class="syncStatus==='ok'?'bg-green-100 text-green-700':syncStatus==='error'?'bg-red-100 text-red-700':'bg-yellow-100 text-yellow-700'">
+            {{ syncStatus==='ok'?'已同步 ✓':syncStatus==='error'?'同步失敗':'同步中…' }}
+          </div>
+        </div>
+
+        <div v-for="hw in selectedHw" :key="hw" class="mb-4">
+          <div class="font-medium text-slate-700 mb-2">📖 {{ hw }}</div>
+          <div v-if="todayRecord?.missing?.[hw]?.length">
+            <div class="flex flex-wrap gap-2">
+              <div v-for="seat in todayRecord.missing[hw]" :key="seat"
+                   class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-red-50 border border-red-200">
+                <span class="text-sm text-red-700 font-medium">座號 {{ seat }}</span>
+                <span class="text-xs px-1.5 py-0.5 rounded-md font-semibold"
+                      :class="daysBadgeClass(getAccumulatedDays(seat,hw))">
+                  累計 {{ getAccumulatedDays(seat,hw) }} 天
+                </span>
+              </div>
+            </div>
+          </div>
+          <div v-else class="text-sm text-green-600 font-medium">✓ 全部繳交</div>
+        </div>
+
+        <div v-if="todayRecord?.absentees?.length" class="mt-2 text-sm text-slate-500">
+          ⚠️ 請假：{{ todayRecord.absentees.join(', ') }} 號
+        </div>
+        <div v-if="todayRecord?.notes" class="mt-2 text-sm text-slate-500">
+          📝 {{ todayRecord.notes }}
+        </div>
+      </div>
+
+      <!-- Action buttons -->
+      <div class="grid grid-cols-2 gap-3 mb-3">
+        <button @click="copyParentNotice" class="py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 transition-colors text-sm">
+          📋 複製家長通知
+        </button>
+        <button @click="exportPDF" class="py-3 rounded-xl font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 transition-colors text-sm">
+          📄 下載 PDF
+        </button>
+      </div>
+      <button @click="manualSync(todayStr())"
+              :disabled="syncStatusMap[todayStr()]==='syncing'"
+              class="w-full py-3 mb-3 rounded-xl font-semibold border transition-all text-sm flex items-center justify-center gap-2"
+              :class="syncStatusMap[todayStr()]==='ok'     ? 'bg-green-50 border-green-300 text-green-700'
+                     : syncStatusMap[todayStr()]==='error'  ? 'bg-red-50 border-red-300 text-red-600'
+                     : syncStatusMap[todayStr()]==='syncing' ? 'bg-slate-50 border-slate-300 text-slate-400 cursor-not-allowed'
+                     : 'bg-white border-slate-300 text-slate-600 hover:bg-emerald-50 hover:border-emerald-300 hover:text-emerald-700'">
+        <span v-if="syncStatusMap[todayStr()]==='syncing'">⏳ 同步中…</span>
+        <span v-else-if="syncStatusMap[todayStr()]==='ok'">✅ 已同步至 Google Sheets</span>
+        <span v-else-if="syncStatusMap[todayStr()]==='error'">❌ 同步失敗，點擊重試</span>
+        <span v-else>☁️ 手動同步至 Google Sheets</span>
+      </button>
+      <div class="grid grid-cols-2 gap-3">
+        <button @click="goToDashboard('today')" class="py-3 rounded-xl font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 transition-colors text-sm">
+          📊 查看儀表板
+        </button>
+        <button @click="currentView='home'" class="py-3 rounded-xl font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 transition-colors text-sm">
+          🏠 回首頁
+        </button>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       DASHBOARD VIEW
+  ══════════════════════════════════════════════════════════════════════════ -->
+  <div v-if="currentView==='dashboard'" class="fade-enter min-h-screen flex">
+
+    <!-- Sidebar (desktop) -->
+    <aside class="hidden md:flex flex-col w-56 bg-white border-r border-slate-200 pt-6 pb-4 px-3 shrink-0 min-h-screen">
+      <div class="flex items-center gap-2 px-3 mb-6">
+        <span class="text-2xl">📚</span>
+        <div>
+          <div class="font-bold text-slate-800 text-sm leading-tight">作業點收</div>
+          <div class="text-xs text-slate-400">{{ className || '未設定班級' }}</div>
+        </div>
+      </div>
+
+      <div class="space-y-1 flex-1">
+        <div v-for="tab in dashboardTabs" :key="tab.id"
+             @click="dashboardTab=tab.id"
+             class="sidebar-item text-sm text-slate-600"
+             :class="dashboardTab===tab.id ? 'active' : ''">
+          <span>{{ tab.icon }}</span>
+          <span>{{ tab.label }}</span>
+        </div>
+      </div>
+
+      <div class="mt-4 pt-4 border-t border-slate-100 space-y-1">
+        <div @click="startCollectionFlow" class="sidebar-item text-sm text-slate-600 cursor-pointer">
+          <span>✏️</span><span>開始點收</span>
+        </div>
+        <div @click="currentView='home'" class="sidebar-item text-sm text-slate-600 cursor-pointer">
+          <span>🏠</span><span>回首頁</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main content -->
+    <div class="flex-1 flex flex-col min-h-screen">
+
+      <!-- Mobile header -->
+      <div class="md:hidden flex items-center gap-3 px-4 py-3 bg-white border-b border-slate-200">
+        <button @click="currentView='home'" class="p-2 rounded-lg hover:bg-slate-100 transition-colors">
+          <svg class="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/>
+          </svg>
+        </button>
+        <h2 class="font-bold text-slate-800">儀表板</h2>
+      </div>
+
+      <!-- Tab content -->
+      <div class="flex-1 p-4 md:p-6 pb-24 md:pb-6 overflow-y-auto">
+
+        <!-- ── Today ── -->
+        <div v-if="dashboardTab==='today'" class="fade-enter max-w-3xl">
+          <div class="flex items-center justify-between mb-5">
+            <h2 class="text-lg font-bold text-slate-800">📋 今日報告</h2>
+            <span class="text-sm text-slate-400">{{ todayStr() }}</span>
+          </div>
+
+          <div v-if="!isTodayCollected" class="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+            <div class="text-5xl mb-3">📝</div>
+            <div class="text-slate-600 font-medium mb-4">今日尚未點收</div>
+            <button @click="startCollectionFlow" class="px-6 py-2.5 rounded-xl bg-blue-500 text-white font-semibold text-sm hover:bg-blue-600 transition-colors">
+              立即點收
+            </button>
+          </div>
+
+          <div v-else>
+            <div id="report-area" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-4">
+              <div class="flex items-center gap-2 mb-5">
+                <div class="font-bold text-slate-800">{{ className }}</div>
+                <div class="ml-auto text-sm text-slate-400">{{ todayStr() }}</div>
+              </div>
+
+              <!-- Summary pills -->
+              <div class="flex gap-3 mb-5">
+                <div class="flex-1 bg-red-50 rounded-xl p-3 text-center">
+                  <div class="text-2xl font-bold text-red-600">{{ todayTotalMiss }}</div>
+                  <div class="text-xs text-red-500 mt-0.5">總缺交人次</div>
+                </div>
+                <div class="flex-1 bg-slate-50 rounded-xl p-3 text-center">
+                  <div class="text-2xl font-bold text-slate-600">{{ todayRecord?.absentees?.length ?? 0 }}</div>
+                  <div class="text-xs text-slate-400 mt-0.5">請假人數</div>
+                </div>
+              </div>
+
+              <div v-for="hw in homeworkItems" :key="hw" class="mb-4">
+                <div class="font-medium text-slate-700 mb-2">📖 {{ hw }}</div>
+                <div v-if="todayRecord?.missing?.[hw]?.length">
+                  <div class="flex flex-wrap gap-2">
+                    <div v-for="seat in todayRecord.missing[hw]" :key="seat"
+                         class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-red-50 border border-red-200">
+                      <span class="text-sm text-red-700 font-medium">座號 {{ seat }}</span>
+                      <span class="text-xs px-1.5 py-0.5 rounded-md font-semibold"
+                            :class="daysBadgeClass(getAccumulatedDays(seat,hw))">
+                        累計 {{ getAccumulatedDays(seat,hw) }} 天
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="text-sm text-green-600 font-medium">✓ 全部繳交</div>
+              </div>
+
+              <div v-if="todayRecord?.absentees?.length" class="mt-3 text-sm text-slate-500">
+                ⚠️ 請假：{{ todayRecord.absentees.join(', ') }} 號
+              </div>
+              <div v-if="todayRecord?.notes" class="mt-2 text-sm text-slate-500">
+                📝 {{ todayRecord.notes }}
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3 mb-3">
+              <button @click="copyParentNotice" class="py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 transition-colors text-sm">
+                📋 複製家長通知
+              </button>
+              <button @click="exportPDF" class="py-3 rounded-xl font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 transition-colors text-sm">
+                📄 下載 PDF
+              </button>
+            </div>
+            <button @click="manualSync(todayStr())"
+                    :disabled="syncStatusMap[todayStr()]==='syncing'"
+                    class="w-full py-3 rounded-xl font-semibold border transition-all text-sm flex items-center justify-center gap-2"
+                    :class="syncStatusMap[todayStr()]==='ok'    ? 'bg-green-50 border-green-300 text-green-700'
+                           : syncStatusMap[todayStr()]==='error'  ? 'bg-red-50 border-red-300 text-red-600'
+                           : syncStatusMap[todayStr()]==='syncing' ? 'bg-slate-50 border-slate-300 text-slate-400 cursor-not-allowed'
+                           : 'bg-white border-slate-300 text-slate-600 hover:bg-emerald-50 hover:border-emerald-300 hover:text-emerald-700'">
+              <span v-if="syncStatusMap[todayStr()]==='syncing'">⏳ 同步中…</span>
+              <span v-else-if="syncStatusMap[todayStr()]==='ok'">✅ 已同步至 Google Sheets</span>
+              <span v-else-if="syncStatusMap[todayStr()]==='error'">❌ 同步失敗，點擊重試</span>
+              <span v-else>☁️ 手動同步至 Google Sheets</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- ── History ── -->
+        <div v-if="dashboardTab==='history'" class="fade-enter max-w-3xl">
+          <div class="flex items-center justify-between mb-5">
+            <h2 class="text-lg font-bold text-slate-800">📜 歷史紀錄</h2>
+            <div class="flex gap-2">
+              <button @click="syncAll"
+                      class="text-sm px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium transition-colors border border-emerald-200 flex items-center gap-1">
+                ☁️ 全部同步
+              </button>
+              <button @click="exportCSV" class="text-sm px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium transition-colors">
+                ↓ CSV
+              </button>
+            </div>
+          </div>
+
+          <div v-if="!sortedHistory.length" class="text-center py-16 text-slate-400">
+            <div class="text-4xl mb-3">📭</div>
+            尚無歷史紀錄
+          </div>
+
+          <div v-for="[date, rec] in sortedHistory" :key="date"
+               class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-3">
+            <div class="flex items-center justify-between mb-3">
+              <div class="font-semibold text-slate-800">{{ fmtDate(date) }}</div>
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs text-slate-400">{{ rec.className }}</span>
+                <!-- sync button -->
+                <button @click="manualSync(date)"
+                        :disabled="syncStatusMap[date]==='syncing'"
+                        class="p-1.5 rounded-lg transition-colors text-xs font-medium flex items-center gap-1"
+                        :class="syncStatusMap[date]==='ok'      ? 'text-green-500 bg-green-50'
+                               : syncStatusMap[date]==='error'   ? 'text-red-400 bg-red-50'
+                               : syncStatusMap[date]==='syncing' ? 'text-slate-300 cursor-not-allowed'
+                               : 'text-slate-300 hover:text-emerald-500 hover:bg-emerald-50'"
+                        :title="syncStatusMap[date]==='ok'?'已同步':syncStatusMap[date]==='error'?'同步失敗，點擊重試':syncStatusMap[date]==='syncing'?'同步中…':'同步至 Google Sheets'">
+                  <svg v-if="syncStatusMap[date]==='syncing'" class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                  <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                  </svg>
+                  <span v-if="syncStatusMap[date]==='ok'" class="text-xs">✓</span>
+                  <span v-else-if="syncStatusMap[date]==='error'" class="text-xs">✗</span>
+                </button>
+                <button @click="deleteRecord(date)"
+                        class="p-1.5 rounded-lg hover:bg-red-50 text-slate-300 hover:text-red-400 transition-colors">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div v-for="(seats, hw) in rec.missing" :key="hw" class="mb-2">
+              <div class="text-xs font-medium text-slate-500 mb-1">{{ hw }}</div>
+              <div v-if="seats.length" class="flex flex-wrap gap-1.5">
+                <span v-for="seat in seats" :key="seat"
+                      class="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-red-50 border border-red-100 text-xs">
+                  <span class="text-red-600 font-medium">{{ seat }}</span>
+                  <span class="px-1 rounded text-xs font-semibold" :class="daysBadgeClass(getAccumulatedDays(seat,hw))">
+                    {{ getAccumulatedDays(seat,hw) }}天
+                  </span>
+                </span>
+              </div>
+              <div v-else class="text-xs text-green-500">✓ 全部繳交</div>
+            </div>
+            <div v-if="rec.absentees?.length" class="text-xs text-slate-400 mt-1">
+              請假：{{ rec.absentees.join(', ') }} 號
+            </div>
+            <div v-if="rec.notes" class="text-xs text-slate-400 mt-1">📝 {{ rec.notes }}</div>
+          </div>
+        </div>
+
+        <!-- ── Range Stats ── -->
+        <div v-if="dashboardTab==='range'" class="fade-enter max-w-3xl">
+          <h2 class="text-lg font-bold text-slate-800 mb-5">📈 區間統計</h2>
+
+          <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+            <div class="grid grid-cols-2 gap-3 mb-4">
+              <div>
+                <label class="text-xs font-medium text-slate-500 block mb-1">開始日期</label>
+                <input v-model="rangeStart" type="date" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-sm">
+              </div>
+              <div>
+                <label class="text-xs font-medium text-slate-500 block mb-1">結束日期</label>
+                <input v-model="rangeEnd" type="date" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-sm">
+              </div>
+            </div>
+            <div class="text-sm text-slate-500">
+              共 {{ rangeRecords.length }} 筆紀錄
+            </div>
+          </div>
+
+          <!-- Day-by-day table -->
+          <div v-if="rangeRecords.length" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+            <div class="font-medium text-slate-700 mb-3">每日缺交一覽</div>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="text-left text-xs text-slate-400 border-b border-slate-100">
+                    <th class="pb-2 font-medium pr-3">日期</th>
+                    <th v-for="hw in homeworkItems" :key="hw" class="pb-2 font-medium pr-3">{{ hw }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="[date, rec] in rangeRecords" :key="date" class="border-b border-slate-50 hover:bg-slate-50">
+                    <td class="py-2 pr-3 text-slate-600 whitespace-nowrap">{{ fmtDate(date) }}</td>
+                    <td v-for="hw in homeworkItems" :key="hw" class="py-2 pr-3">
+                      <span v-if="rec.missing?.[hw]?.length"
+                            class="px-1.5 py-0.5 rounded bg-red-100 text-red-600 text-xs font-semibold">
+                        {{ rec.missing[hw].length }} 人
+                      </span>
+                      <span v-else class="text-green-500 text-xs">✓</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Miss frequency leaderboard -->
+          <div v-if="rangeMissFreq.length" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+            <div class="font-medium text-slate-700 mb-3">缺交頻率排行</div>
+            <div class="space-y-2">
+              <div v-for="item in rangeMissFreq.slice(0,20)" :key="item.seat+'_'+item.hw"
+                   class="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-slate-50">
+                <div class="flex-1 flex items-center gap-2">
+                  <span class="text-slate-700 font-medium text-sm">座號 {{ item.seat }}</span>
+                  <span class="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded">{{ item.hw }}</span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <div class="w-20 bg-slate-100 rounded-full h-1.5">
+                    <div class="h-1.5 rounded-full bg-orange-400"
+                         :style="'width:'+Math.min(100,(item.count/rangeRecords.length)*100)+'%'"></div>
+                  </div>
+                  <span class="text-sm font-bold" :class="item.count>=5?'text-red-500':item.count>=3?'text-orange-500':'text-slate-500'">
+                    {{ item.count }} 次
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="rangeStart && rangeEnd && !rangeRecords.length"
+               class="text-center py-12 text-slate-400">
+            <div class="text-4xl mb-3">🔍</div>
+            此區間無紀錄
+          </div>
+        </div>
+
+        <!-- ── Settings ── -->
+        <div v-if="dashboardTab==='settings'" class="fade-enter max-w-lg">
+          <h2 class="text-lg font-bold text-slate-800 mb-5">⚙️ 系統設定</h2>
+
+          <!-- Basic info -->
+          <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+            <div class="font-medium text-slate-700 mb-4">基本設定</div>
+            <div class="space-y-4">
+              <div>
+                <label class="text-xs font-medium text-slate-500 block mb-1">班級名稱</label>
+                <input v-model="className" type="text" placeholder="例：三年二班"
+                       class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm">
+              </div>
+              <div>
+                <label class="text-xs font-medium text-slate-500 block mb-1">座位數量</label>
+                <input v-model.number="seatCount" type="number" min="1" max="60"
+                       class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm">
+              </div>
+            </div>
+          </div>
+
+          <!-- Empty seats -->
+          <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+            <div class="font-medium text-slate-700 mb-1">空號設定</div>
+            <p class="text-xs text-slate-400 mb-3">設定班上不存在的座號（空號），這些座號在點收和請假時會顯示為灰色並鎖定。</p>
+            <div v-if="emptySeats.length" class="flex flex-wrap gap-1.5 mb-3">
+              <span v-for="s in emptySeats" :key="s"
+                    class="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 text-xs font-medium">
+                {{ s }} 號
+              </span>
+            </div>
+            <div v-else class="text-xs text-slate-400 mb-3">目前無空號設定</div>
+            <div class="flex gap-2">
+              <input v-model="emptySeatsInput" type="text"
+                     placeholder="輸入空號，以逗號或空格分隔，例：4, 17, 23"
+                     @keyup.enter="saveEmptySeats"
+                     class="flex-1 border border-slate-300 rounded-xl px-4 py-2 text-sm">
+              <button @click="saveEmptySeats"
+                      class="px-4 py-2 rounded-xl bg-slate-600 text-white font-semibold text-sm hover:bg-slate-700 transition-colors whitespace-nowrap">
+                儲存
+              </button>
+            </div>
+            <p class="text-xs text-slate-400 mt-2">輸入後按「儲存」，留空並儲存可清除所有空號。</p>
+          </div>
+
+          <!-- Homework items -->
+          <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+            <div class="font-medium text-slate-700 mb-4">作業項目</div>
+            <div class="space-y-2 mb-3">
+              <div v-for="(hw, i) in homeworkItems" :key="i"
+                   class="flex items-center gap-2 py-2 px-3 rounded-xl bg-slate-50">
+                <span class="flex-1 text-sm text-slate-700">{{ hw }}</span>
+                <button @click="removeHwItem(i)"
+                        class="p-1 rounded-lg hover:bg-red-100 text-slate-300 hover:text-red-400 transition-colors">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <input v-model="newHwItem" type="text" placeholder="新增作業項目…"
+                     @keyup.enter="addHwItem"
+                     class="flex-1 border border-slate-300 rounded-xl px-4 py-2 text-sm">
+              <button @click="addHwItem"
+                      class="px-4 py-2 rounded-xl bg-blue-500 text-white font-semibold text-sm hover:bg-blue-600 transition-colors">
+                新增
+              </button>
+            </div>
+          </div>
+
+          <!-- Google Sheets -->
+          <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
+            <div class="font-medium text-slate-700 mb-1">Google Sheets 同步</div>
+            <p class="text-xs text-slate-400 mb-3">
+              部署 Google Apps Script Web App 並貼上 URL，每次點收後自動同步至試算表。
+              <a href="https://developers.google.com/apps-script/guides/web" target="_blank"
+                 class="text-blue-500 hover:underline">教學 →</a>
+            </p>
+            <input v-model="sheetsWebAppUrl" type="url"
+                   placeholder="https://script.google.com/macros/s/…/exec"
+                   class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm">
+          </div>
+
+          <!-- Danger zone -->
+          <div class="bg-white rounded-2xl border border-red-200 shadow-sm p-5">
+            <div class="font-medium text-red-500 mb-3">危險操作</div>
+            <button @click="()=>{ if(confirm('確定清除所有歷史紀錄？此操作無法復原！')) { historyLog={}; showToast('已清除所有紀錄'); } }"
+                    class="px-4 py-2 rounded-xl bg-red-50 text-red-500 font-semibold text-sm hover:bg-red-100 transition-colors border border-red-200">
+              清除所有歷史紀錄
+            </button>
+          </div>
+        </div>
+
+      </div><!-- /tab content -->
+
+      <!-- Mobile bottom nav -->
+      <nav class="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex z-40">
+        <div v-for="tab in dashboardTabs" :key="tab.id"
+             @click="dashboardTab=tab.id"
+             class="nav-tab"
+             :class="dashboardTab===tab.id ? 'active' : ''">
+          <span class="text-lg">{{ tab.icon }}</span>
+          <span>{{ tab.label }}</span>
+        </div>
+      </nav>
+
+    </div><!-- /main content -->
+  </div><!-- /dashboard -->
+
+</div>
+    `
+  });
+
+  app.mount('#app');
+})();
+</script>
+</body>
+</html>
