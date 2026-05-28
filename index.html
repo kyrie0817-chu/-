@@ -265,6 +265,17 @@
 
       const isMissing = (hw, seat) => missingMap.value[hw]?.has(seat) ?? false;
 
+      // 該科全部標為「已繳」
+      const setAllSubmitted = hw => {
+        missingMap.value = { ...missingMap.value, [hw]: new Set() };
+      };
+
+      // 該科全部標為「未繳」（還原預設）
+      const setAllMissing = hw => {
+        const active = allSeats.value.filter(s => !isEmptySeat(s) && !isAbsent(s));
+        missingMap.value = { ...missingMap.value, [hw]: new Set(active) };
+      };
+
       // ── 建立「累計積欠天數」對照表（給 Sheets 用）─────────────────────────
       // 回傳 { hwName: { seat: days } }
       const buildAccumDays = record => {
@@ -511,7 +522,7 @@
         isEmptySeat, isAbsent,
         inlineNewHw, addInlineHw,
         startCollectionFlow, goToDashboard, goToStep, toggleMissing,
-        toggleAbsent, isMissing, saveCollection, copyParentNotice,
+        toggleAbsent, isMissing, setAllSubmitted, setAllMissing, saveCollection, copyParentNotice,
         exportCSV, exportPDF, deleteRecord, addHwItem, removeHwItem,
         manualSync, syncAll, saveEmptySeats, showToast, fmtDate, todayStr,
       };
@@ -733,9 +744,25 @@
       <div v-for="hw in selectedHw" :key="hw" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold text-slate-700">📖 {{ hw }}</h3>
-          <span class="text-xs text-slate-400">
-            缺交 {{ [...(missingMap[hw]??new Set())].length }} 人
-          </span>
+          <div class="flex items-center gap-2">
+            <!-- 缺交人數 -->
+            <span class="text-xs font-medium"
+                  :class="[...(missingMap[hw]??new Set())].length > 0 ? 'text-red-500' : 'text-green-600'">
+              缺交 {{ [...(missingMap[hw]??new Set())].length }} 人
+            </span>
+            <!-- 全部已繳 -->
+            <button @click="setAllSubmitted(hw)"
+                    class="text-xs px-2.5 py-1 rounded-lg font-medium transition-colors bg-green-50 text-green-700 border border-green-200 hover:bg-green-100"
+                    title="將此科全部標為已繳">
+              ✓ 全部已繳
+            </button>
+            <!-- 全部未繳 -->
+            <button @click="setAllMissing(hw)"
+                    class="text-xs px-2.5 py-1 rounded-lg font-medium transition-colors bg-red-50 text-red-600 border border-red-200 hover:bg-red-100"
+                    title="將此科全部標為未繳">
+              ✗ 全部未繳
+            </button>
+          </div>
         </div>
         <div class="grid gap-2" style="grid-template-columns: repeat(auto-fill, minmax(44px, 1fr))">
           <button v-for="seat in allSeats" :key="seat"
