@@ -228,11 +228,10 @@
         currentView.value  = 'dashboard';
       };
 
+      // 步驟順序：1=請假 → 2=選作業 → 3=點收格子 → 4=完成
       const goToStep = step => {
-        if (step === 2) {
-          if (!selectedHw.value.length) { showToast('請至少選擇一項作業', 'error'); return; }
-        }
         if (step === 3) {
+          if (!selectedHw.value.length) { showToast('請至少選擇一項作業', 'error'); return; }
           // 預設：所有有效座位（非空號、非請假）全部為「未繳」
           const activeMissing = allSeats.value.filter(s => !isEmptySeat(s) && !isAbsent(s));
           const newMap = {};
@@ -242,6 +241,19 @@
           missingMap.value = newMap;
         }
         collectionStep.value = step;
+      };
+
+      // 在點收流程中直接新增作業項目
+      const inlineNewHw = ref('');
+      const addInlineHw = () => {
+        const v = inlineNewHw.value.trim();
+        if (!v) return;
+        if (!homeworkItems.value.includes(v)) {
+          homeworkItems.value = [...homeworkItems.value, v];
+        }
+        // 自動勾選剛新增的項目
+        if (!selectedHw.value.includes(v)) selectedHw.value.push(v);
+        inlineNewHw.value = '';
       };
 
       const toggleMissing = (hw, seat) => {
@@ -497,6 +509,7 @@
         rangeRecords, rangeMissFreq, sortedHistory,
         getAccumulatedDays, totalAccumulatedDays, daysBadgeClass,
         isEmptySeat, isAbsent,
+        inlineNewHw, addInlineHw,
         startCollectionFlow, goToDashboard, goToStep, toggleMissing,
         toggleAbsent, isMissing, saveCollection, copyParentNotice,
         exportCSV, exportPDF, deleteRecord, addHwItem, removeHwItem,
@@ -618,7 +631,7 @@
 
     <!-- Step Indicator -->
     <div class="flex items-center mb-8 px-2">
-      <template v-for="(s,i) in [{l:'選擇作業'},{l:'登記請假'},{l:'點收登錄'},{l:'完成報告'}]" :key="i">
+      <template v-for="(s,i) in [{l:'登記請假'},{l:'選擇作業'},{l:'點收登錄'},{l:'完成報告'}]" :key="i">
         <div class="flex flex-col items-center" style="min-width:48px">
           <div class="step-dot w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold border-2"
                :class="collectionStep>i+1 ? 'bg-blue-500 border-blue-500 text-white'
@@ -634,36 +647,17 @@
       </template>
     </div>
 
-    <!-- ── Step 1: Select Homework ── -->
+    <!-- ── Step 1: Absentees (checkbox grid) ── -->
     <div v-if="collectionStep===1" class="fade-enter bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
-      <h3 class="font-semibold text-slate-700 mb-4">今日要點收哪些作業？</h3>
-      <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
-        <button v-for="hw in homeworkItems" :key="hw"
-                @click="selectedHw.includes(hw) ? selectedHw.splice(selectedHw.indexOf(hw),1) : selectedHw.push(hw)"
-                class="py-3 px-4 rounded-xl border-2 text-sm font-medium transition-all"
-                :class="selectedHw.includes(hw) ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600 hover:border-slate-300'">
-          {{ hw }}
-        </button>
-      </div>
-      <div v-if="!homeworkItems.length" class="text-sm text-slate-400 mb-4 text-center py-4">
-        請先至設定頁面新增作業項目
-      </div>
-      <button @click="goToStep(2)" :disabled="!selectedHw.length"
-              class="w-full py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 disabled:opacity-40 transition-colors">
-        下一步 →
-      </button>
-    </div>
-
-    <!-- ── Step 2: Absentees (checkbox grid) ── -->
-    <div v-if="collectionStep===2" class="fade-enter bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
       <div class="flex items-center justify-between mb-1">
-        <h3 class="font-semibold text-slate-700">今日請假座號</h3>
-        <span class="text-xs text-amber-600 font-medium bg-amber-50 px-2 py-0.5 rounded-full">
+        <h3 class="font-semibold text-slate-700">今日缺席 / 請假</h3>
+        <span class="text-xs font-medium px-2 py-0.5 rounded-full"
+              :class="absentees.length ? 'bg-amber-50 text-amber-600' : 'bg-slate-100 text-slate-400'">
           已選 {{ absentees.length }} 人
         </span>
       </div>
-      <p class="text-sm text-slate-400 mb-4">點擊座號來標示請假（可不填）</p>
-      <div class="grid gap-2 mb-5" style="grid-template-columns: repeat(auto-fill, minmax(44px, 1fr))">
+      <p class="text-sm text-slate-400 mb-4">點擊座號標示請假／缺席，不需要請假可直接下一步</p>
+      <div class="grid gap-2 mb-4" style="grid-template-columns: repeat(auto-fill, minmax(44px, 1fr))">
         <button v-for="seat in allSeats" :key="seat"
                 @click="toggleAbsent(seat)"
                 :disabled="isEmptySeat(seat)"
@@ -671,20 +665,72 @@
                 :class="isEmptySeat(seat) ? 'bg-slate-50 text-slate-200 cursor-not-allowed border-slate-100'
                        : isAbsent(seat)   ? 'bg-amber-100 border-amber-400 text-amber-700 ring-2 ring-amber-300'
                        :                    'bg-white border-slate-200 text-slate-600 hover:border-amber-300 hover:bg-amber-50'"
-                :title="isEmptySeat(seat)?'空號':isAbsent(seat)?'請假（點擊取消）':'點擊標示請假'">
+                :title="isEmptySeat(seat)?'空號':isAbsent(seat)?'已選（點擊取消）':'點擊標示請假'">
           {{ seat }}
         </button>
       </div>
       <div class="flex gap-4 text-xs text-slate-400 mb-5">
-        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border border-slate-200 bg-white inline-block"></span>正常</span>
-        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border-2 border-amber-400 bg-amber-100 inline-block"></span>請假</span>
+        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border border-slate-200 bg-white inline-block"></span>正常出席</span>
+        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border-2 border-amber-400 bg-amber-100 inline-block"></span>請假／缺席</span>
         <span class="flex items-center gap-1"><span class="w-3 h-3 rounded border border-slate-100 bg-slate-50 inline-block"></span>空號</span>
       </div>
+      <button @click="goToStep(2)"
+              class="w-full py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 transition-colors">
+        下一步 →
+      </button>
+    </div>
+
+    <!-- ── Step 2: Select & Customize Homework ── -->
+    <div v-if="collectionStep===2" class="fade-enter bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+      <div class="flex items-center justify-between mb-1">
+        <h3 class="font-semibold text-slate-700">今日要點收哪些作業？</h3>
+        <span class="text-xs font-medium px-2 py-0.5 rounded-full"
+              :class="selectedHw.length ? 'bg-blue-50 text-blue-600' : 'bg-slate-100 text-slate-400'">
+          已選 {{ selectedHw.length }} 項
+        </span>
+      </div>
+      <p class="text-sm text-slate-400 mb-4">可直接新增今日臨時作業項目</p>
+
+      <!-- Homework toggle buttons -->
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
+        <button v-for="hw in homeworkItems" :key="hw"
+                @click="selectedHw.includes(hw) ? selectedHw.splice(selectedHw.indexOf(hw),1) : selectedHw.push(hw)"
+                class="py-2.5 px-3 rounded-xl border-2 text-sm font-medium transition-all text-left flex items-center gap-2"
+                :class="selectedHw.includes(hw)
+                  ? 'border-blue-500 bg-blue-50 text-blue-700'
+                  : 'border-slate-200 text-slate-600 hover:border-blue-300 hover:bg-blue-50'">
+          <span class="w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 text-xs"
+                :class="selectedHw.includes(hw) ? 'border-blue-500 bg-blue-500 text-white' : 'border-slate-300'">
+            <span v-if="selectedHw.includes(hw)">✓</span>
+          </span>
+          {{ hw }}
+        </button>
+      </div>
+
+      <!-- Inline add new homework item -->
+      <div class="border border-dashed border-slate-300 rounded-xl p-3 mb-5 bg-slate-50">
+        <p class="text-xs text-slate-400 mb-2">➕ 新增今日臨時作業（也會存入設定）</p>
+        <div class="flex gap-2">
+          <input v-model="inlineNewHw" type="text" placeholder="輸入作業名稱…"
+                 @keyup.enter="addInlineHw"
+                 class="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white">
+          <button @click="addInlineHw"
+                  class="px-4 py-2 rounded-lg bg-blue-500 text-white font-semibold text-sm hover:bg-blue-600 transition-colors whitespace-nowrap">
+            新增
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!homeworkItems.length && !inlineNewHw" class="text-sm text-slate-400 text-center py-2 mb-4">
+        尚無作業項目，請在上方輸入新增
+      </div>
+
       <div class="flex gap-3">
         <button @click="collectionStep=1" class="flex-1 py-3 rounded-xl font-semibold text-slate-600 border border-slate-300 hover:bg-slate-50 transition-colors">
           ← 上一步
         </button>
-        <button @click="goToStep(3)" class="flex-1 py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 transition-colors">
+        <button @click="goToStep(3)" :disabled="!selectedHw.length"
+                class="flex-1 py-3 rounded-xl font-semibold text-white bg-blue-500 hover:bg-blue-600 disabled:opacity-40 transition-colors">
           下一步 →
         </button>
       </div>
