@@ -77,6 +77,7 @@
       const sheetsWebAppUrl = ref('');
       const emptySeats      = ref([]);   // 空號：不存在的座號
       const emptySeatsInput = ref('');   // settings 編輯暫存
+      const fixedHw         = ref(['聯絡簿']); // 固定必收項目（預設全選且鎖定）
 
       // ── Collection State ───────────────────────────────────────────────────
       const selectedHw  = ref([]);
@@ -113,6 +114,7 @@
           homeworkItems:   homeworkItems.value,
           sheetsWebAppUrl: sheetsWebAppUrl.value,
           emptySeats:      emptySeats.value,
+          fixedHw:         fixedHw.value,
           historyLog:      historyLog.value,
         }));
       }, 300);
@@ -127,11 +129,12 @@
           if (d.homeworkItems)   homeworkItems.value   = d.homeworkItems;
           if (d.sheetsWebAppUrl) sheetsWebAppUrl.value = d.sheetsWebAppUrl;
           if (d.emptySeats)      { emptySeats.value = d.emptySeats; emptySeatsInput.value = d.emptySeats.join(', '); }
+          if (d.fixedHw)         fixedHw.value         = d.fixedHw;
           if (d.historyLog)      historyLog.value      = d.historyLog;
         } catch(e) { console.error(e); }
       };
 
-      watch([className, seatCount, homeworkItems, sheetsWebAppUrl, emptySeats, historyLog],
+      watch([className, seatCount, homeworkItems, sheetsWebAppUrl, emptySeats, fixedHw, historyLog],
             persist, { deep:true });
 
       onMounted(load);
@@ -205,12 +208,20 @@
 
       // ── Collection flow ────────────────────────────────────────────────────
       const startCollectionFlow = () => {
-        selectedHw.value      = [...homeworkItems.value]; // 預設全選（常態作業）
-        absentees.value       = [];                       // 預設全員出席
+        // 只預選「固定項目」（如聯絡簿），其餘由使用者手動勾選
+        selectedHw.value      = homeworkItems.value.filter(hw => fixedHw.value.includes(hw));
+        absentees.value       = [];
         missingMap.value      = {};
         collectionNotes.value = '';
         collectionStep.value  = 1;
         currentView.value     = 'collection';
+      };
+
+      // 切換固定項目（設定頁）
+      const toggleFixedHw = hw => {
+        const idx = fixedHw.value.indexOf(hw);
+        if (idx >= 0) fixedHw.value = fixedHw.value.filter((_, i) => i !== idx);
+        else fixedHw.value = [...fixedHw.value, hw];
       };
 
       // 切換請假狀態
@@ -512,7 +523,7 @@
       return {
         currentView, collectionStep, dashboardTab, sidebarOpen, dashboardTabs,
         className, seatCount, homeworkItems, newHwItem, sheetsWebAppUrl,
-        emptySeats, emptySeatsInput,
+        emptySeats, emptySeatsInput, fixedHw,
         selectedHw, absentees, missingMap, collectionNotes,
         historyLog, rangeStart, rangeEnd, syncStatus, syncStatusMap, toast, toastType,
         allSeats, todayRecord, isTodayCollected, todayTotalMiss,
@@ -523,7 +534,7 @@
         inlineNewHw, addInlineHw,
         startCollectionFlow, goToDashboard, goToStep, toggleMissing,
         toggleAbsent, isMissing, setAllSubmitted, setAllMissing, saveCollection, copyParentNotice,
-        exportCSV, exportPDF, deleteRecord, addHwItem, removeHwItem,
+        exportCSV, exportPDF, deleteRecord, addHwItem, removeHwItem, toggleFixedHw,
         manualSync, syncAll, saveEmptySeats, showToast, fmtDate, todayStr,
       };
     },
@@ -693,7 +704,7 @@
       </button>
     </div>
 
-    <!-- ── Step 2: Select Homework — 預設全選，點擊取消不收的項目 ── -->
+    <!-- ── Step 2: Select Homework — 手動勾選，固定項目（📌）預選且鎖定 ── -->
     <div v-if="collectionStep===2" class="fade-enter bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
       <div class="flex items-center justify-between mb-1">
         <h3 class="font-semibold text-slate-700">今日點收作業</h3>
@@ -702,17 +713,26 @@
           已選 {{ selectedHw.length }} / {{ homeworkItems.length }} 項
         </span>
       </div>
-      <p class="text-sm text-slate-400 mb-4">預設全選。若今天某科不收，點擊取消</p>
+      <p class="text-sm text-slate-400 mb-4">
+        點擊選擇今日要點收的作業。
+        <span class="text-amber-600 font-medium">📌 固定項目</span> 永遠預選且無法取消。
+      </p>
 
-      <!-- Homework toggle buttons — 預設全亮藍，點擊變灰取消 -->
+      <!-- Homework toggle buttons -->
       <div class="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
         <button v-for="hw in homeworkItems" :key="hw"
-                @click="selectedHw.includes(hw) ? selectedHw.splice(selectedHw.indexOf(hw),1) : selectedHw.push(hw)"
+                @click="fixedHw.includes(hw)
+                  ? showToast(hw + ' 為固定收件項目，無法取消', 'error')
+                  : (selectedHw.includes(hw) ? selectedHw.splice(selectedHw.indexOf(hw),1) : selectedHw.push(hw))"
                 class="py-3 px-3 rounded-xl border-2 text-sm font-medium transition-all text-left flex items-center gap-2"
-                :class="selectedHw.includes(hw)
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-slate-200 bg-slate-50 text-slate-400 line-through'">
-          <span class="w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 text-xs"
+                :class="fixedHw.includes(hw)
+                  ? 'border-amber-400 bg-amber-50 text-amber-700 cursor-default'
+                  : selectedHw.includes(hw)
+                    ? 'border-blue-500 bg-blue-50 text-blue-700'
+                    : 'border-slate-200 bg-slate-50 text-slate-400'">
+          <!-- 固定項目：📌 圖示；一般項目：勾選框 -->
+          <span v-if="fixedHw.includes(hw)" class="shrink-0 text-xs">📌</span>
+          <span v-else class="w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 text-xs"
                 :class="selectedHw.includes(hw) ? 'border-blue-500 bg-blue-500 text-white' : 'border-slate-300 bg-white'">
             <span v-if="selectedHw.includes(hw)">✓</span>
           </span>
@@ -1204,11 +1224,26 @@
 
           <!-- Homework items -->
           <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-4">
-            <div class="font-medium text-slate-700 mb-4">作業項目</div>
+            <div class="font-medium text-slate-700 mb-1">作業項目</div>
+            <p class="text-xs text-slate-400 mb-3">
+              點擊 📌 可將作業設為「固定項目」，每次點收時自動預選且無法取消。
+            </p>
             <div class="space-y-2 mb-3">
               <div v-for="(hw, i) in homeworkItems" :key="i"
-                   class="flex items-center gap-2 py-2 px-3 rounded-xl bg-slate-50">
-                <span class="flex-1 text-sm text-slate-700">{{ hw }}</span>
+                   class="flex items-center gap-2 py-2 px-3 rounded-xl"
+                   :class="fixedHw.includes(hw) ? 'bg-amber-50 border border-amber-200' : 'bg-slate-50'">
+                <!-- 固定項目 pin 按鈕 -->
+                <button @click="toggleFixedHw(hw)"
+                        :title="fixedHw.includes(hw) ? '取消固定' : '設為固定項目'"
+                        class="text-base leading-none transition-all shrink-0"
+                        :class="fixedHw.includes(hw) ? 'opacity-100' : 'opacity-25 hover:opacity-70'">
+                  📌
+                </button>
+                <span class="flex-1 text-sm font-medium"
+                      :class="fixedHw.includes(hw) ? 'text-amber-700' : 'text-slate-700'">
+                  {{ hw }}
+                  <span v-if="fixedHw.includes(hw)" class="ml-1 text-xs font-normal text-amber-500">固定</span>
+                </span>
                 <button @click="removeHwItem(i)"
                         class="p-1 rounded-lg hover:bg-red-100 text-slate-300 hover:text-red-400 transition-colors">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
