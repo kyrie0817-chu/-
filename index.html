@@ -359,6 +359,19 @@
         showToast(`同步完成：${ok} 成功${fail ? '、' + fail + ' 失敗' : ''} ✓`, fail ? 'error' : 'success');
       };
 
+      // ── 補繳：從已儲存紀錄中移除某座號的缺交 ──────────────────────────────
+      const markSubmitted = (date, hw, seat) => {
+        const rec = historyLog.value[date];
+        if (!rec || !rec.missing?.[hw]) return;
+        const updatedMissing = { ...rec.missing, [hw]: rec.missing[hw].filter(s => s !== seat) };
+        const updatedRec = { ...rec, missing: updatedMissing };
+        historyLog.value = { ...historyLog.value, [date]: updatedRec };
+        showToast(`座號 ${seat}・${hw} 已標記補繳 ✓`);
+        if (sheetsWebAppUrl.value) {
+          syncRecord(date, updatedRec, date === todayStr() ? syncStatus : null, null);
+        }
+      };
+
       // ── Save collection ────────────────────────────────────────────────────
       const saveCollection = async () => {
         const missing = {};
@@ -535,7 +548,7 @@
         startCollectionFlow, goToDashboard, goToStep, toggleMissing,
         toggleAbsent, isMissing, setAllSubmitted, setAllMissing, saveCollection, copyParentNotice,
         exportCSV, exportPDF, deleteRecord, addHwItem, removeHwItem, toggleFixedHw,
-        manualSync, syncAll, saveEmptySeats, showToast, fmtDate, todayStr,
+        manualSync, syncAll, saveEmptySeats, markSubmitted, showToast, fmtDate, todayStr,
       };
     },
 
@@ -836,17 +849,25 @@
           </div>
         </div>
 
+        <p class="text-xs text-slate-400 mb-4 flex items-center gap-1">
+          <span>💡</span> 點擊紅色座號可標記為補繳
+        </p>
+
         <div v-for="hw in selectedHw" :key="hw" class="mb-4">
           <div class="font-medium text-slate-700 mb-2">📖 {{ hw }}</div>
           <div v-if="todayRecord?.missing?.[hw]?.length">
             <div class="flex flex-wrap gap-2">
               <div v-for="seat in todayRecord.missing[hw]" :key="seat"
-                   class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-red-50 border border-red-200">
+                   @click="markSubmitted(todayStr(), hw, seat)"
+                   class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border cursor-pointer transition-all select-none
+                          bg-red-50 border-red-200 hover:bg-green-50 hover:border-green-400 hover:scale-105 active:scale-95"
+                   title="點擊標記為補繳">
                 <span class="text-sm text-red-700 font-medium">座號 {{ seat }}</span>
                 <span class="text-xs px-1.5 py-0.5 rounded-md font-semibold"
                       :class="daysBadgeClass(getAccumulatedDays(seat,hw))">
                   累計 {{ getAccumulatedDays(seat,hw) }} 天
                 </span>
+                <span class="text-slate-300 text-xs leading-none">✕</span>
               </div>
             </div>
           </div>
@@ -979,17 +1000,25 @@
                 </div>
               </div>
 
+              <p class="text-xs text-slate-400 mb-4 flex items-center gap-1">
+                <span>💡</span> 點擊紅色座號可標記為補繳
+              </p>
+
               <div v-for="hw in homeworkItems" :key="hw" class="mb-4">
                 <div class="font-medium text-slate-700 mb-2">📖 {{ hw }}</div>
                 <div v-if="todayRecord?.missing?.[hw]?.length">
                   <div class="flex flex-wrap gap-2">
                     <div v-for="seat in todayRecord.missing[hw]" :key="seat"
-                         class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-red-50 border border-red-200">
+                         @click="markSubmitted(todayStr(), hw, seat)"
+                         class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border cursor-pointer transition-all select-none
+                                bg-red-50 border-red-200 hover:bg-green-50 hover:border-green-400 hover:scale-105 active:scale-95"
+                         title="點擊標記為補繳">
                       <span class="text-sm text-red-700 font-medium">座號 {{ seat }}</span>
                       <span class="text-xs px-1.5 py-0.5 rounded-md font-semibold"
                             :class="daysBadgeClass(getAccumulatedDays(seat,hw))">
                         累計 {{ getAccumulatedDays(seat,hw) }} 天
                       </span>
+                      <span class="text-slate-300 text-xs leading-none">✕</span>
                     </div>
                   </div>
                 </div>
